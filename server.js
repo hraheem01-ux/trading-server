@@ -93,7 +93,7 @@ async function checkMarket() {
       if (confidence >= 90) {
         await resend.emails.send({
           from: "Trading Alerts <onboarding@resend.dev>",
-          to: ["ايميلك هنا"], // ⚠️ حط ايميلك
+          to: ["hraheem01@gmail.com"], // ⚠️ حط ايميلك
           subject: `🔥 ${decision} ${symbol} بنسبة ${confidence}%`,
           html: `
             <div style="font-family:Arial; direction:rtl">
