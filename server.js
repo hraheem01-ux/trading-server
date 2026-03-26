@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import { Resend } from "resend";
+import fetch from "node-fetch";
 
 const app = express();
 app.use(cors());
@@ -9,9 +10,15 @@ app.use(express.json());
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// لمنع تكرار الإيميلات
+// الأسهم اللي نراقبها
+const SYMBOLS = ["TSLA", "NVDA", "RUN", "SOFI"];
+
+// منع التكرار
 const lastAlerts = {};
 
+// ===============================
+// API إرسال التنبيهات
+// ===============================
 app.post("/api/send-alert", async (req, res) => {
   try {
     const { symbol, decision, confidence, price, email } = req.body;
@@ -55,6 +62,69 @@ app.post("/api/send-alert", async (req, res) => {
   }
 });
 
-app.listen(3001, () => {
-  console.log("🚀 Email server running on http://localhost:3001");
+// ===============================
+// 🔥 المراقبة التلقائية
+// ===============================
+async function checkMarket() {
+  try {
+    for (const symbol of SYMBOLS) {
+
+      const res = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`
+      );
+      const data = await res.json();
+
+      const price =
+        data.chart.result[0].meta.regularMarketPrice;
+
+      console.log(`📊 ${symbol}:`, price);
+
+      // تحليل بسيط (تقدر تطوره لاحقًا)
+      const decision = price > 200 ? "بيع" : "شراء";
+      const confidence = 92;
+
+      const key = `${symbol}-${decision}`;
+
+      if (lastAlerts[symbol] === key) {
+        console.log(`⏭️ ${symbol} تم تخطي التكرار`);
+        continue;
+      }
+
+      if (confidence >= 90) {
+        await resend.emails.send({
+          from: "Trading Alerts <onboarding@resend.dev>",
+          to: ["ايميلك هنا"], // ⚠️ حط ايميلك
+          subject: `🔥 ${decision} ${symbol} بنسبة ${confidence}%`,
+          html: `
+            <div style="font-family:Arial; direction:rtl">
+              <h2>🚨 تنبيه تلقائي</h2>
+              <p>السهم: <b>${symbol}</b></p>
+              <p>القرار: <b>${decision}</b></p>
+              <p>الثقة: <b>${confidence}%</b></p>
+              <p>السعر: <b>$${price}</b></p>
+            </div>
+          `,
+        });
+
+        console.log(`📧 تم إرسال تنبيه لـ ${symbol}`);
+
+        lastAlerts[symbol] = key;
+      }
+    }
+
+  } catch (err) {
+    console.error("❌ خطأ في السوق:", err);
+  }
+}
+
+// ⏱️ كل دقيقة
+setInterval(checkMarket, 60000);
+
+// ===============================
+// تشغيل السيرفر
+// ===============================
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
