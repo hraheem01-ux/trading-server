@@ -12,7 +12,18 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 const ALERT_EMAIL = "Hraheem01@gmail.com";
 const SYMBOLS = ["TSLA", "NVDA", "RUN", "SOFI"];
 const CHECK_INTERVAL_MS = 120000; // كل دقيقتين
+const REQUEST_TIMEOUT_MS = 15000;
+const MAX_RETRIES = 3;
+
 const lastAlerts = {};
+const lastStatus = {
+  startedAt: new Date().toISOString(),
+  lastRunAt: null,
+  lastSuccessAt: null,
+  lastErrorAt: null,
+  lastErrorMessage: null,
+  symbols: {},
+};
 
 // ===============================
 // أدوات مساعدة
@@ -32,6 +43,69 @@ function sum(arr) {
 
 function formatPrice(value) {
   return Number(value).toFixed(2);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function extractErrorMessage(err) {
+  if (!err) return "Unknown error";
+  return err.message || String(err);
+}
+
+async function fetchJsonWithTimeout(url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        accept: "application/json,text/plain,*/*",
+        "accept-language": "en-US,en;q=0.9",
+        ...options.headers,
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    }
+
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchWithRetry(urls, options = {}, retries = MAX_RETRIES) {
+  let lastErr = null;
+
+  for (const url of urls) {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        console.log(`🌐 Fetch attempt ${attempt}/${retries}: ${url}`);
+        const data = await fetchJsonWithTimeout(url, options, REQUEST_TIMEOUT_MS);
+        return data;
+      } catch (err) {
+        lastErr = err;
+        console.log(`⚠️ Fetch failed attempt ${attempt}/${retries}: ${extractErrorMessage(err)}`);
+
+        if (attempt < retries) {
+          await sleep(1200 * attempt);
+        }
+      }
+    }
+  }
+
+  throw lastErr || new Error("All fetch attempts failed");
 }
 
 function calculateRSI(closes, period = 14) {
@@ -114,7 +188,6 @@ function buildBarsFromYahoo(data) {
 function findAnchorIndex(bars) {
   if (bars.length < 10) return 0;
 
-  // نأخذ آخر 20 شمعة ونبحث عن آخر قاع/قمة مهمين
   const lookback = Math.min(20, bars.length - 1);
   const slice = bars.slice(-lookback);
 
@@ -126,9 +199,7 @@ function findAnchorIndex(bars) {
     if (slice[i].high > slice[highestIndex].high) highestIndex = i;
   }
 
-  // نختار الأحدث بينهما كمرساة حديثة
   const recentIndex = Math.max(lowestIndex, highestIndex);
-
   return bars.length - lookback + recentIndex;
 }
 
@@ -238,7 +309,7 @@ function calculateOrderFlowApprox(bars) {
   for (const bar of recent) {
     const range = Math.max(bar.high - bar.low, 0.0001);
     const body = Math.abs(bar.close - bar.open);
-    const closeLocation = (bar.close - bar.low) / range; // 0 إلى 1
+    const closeLocation = (bar.close - bar.low) / range;
     const impulse = (body / range) * bar.volume;
 
     buyPressure += impulse * closeLocation;
@@ -251,7 +322,7 @@ function calculateOrderFlowApprox(bars) {
   return {
     buyPressure,
     sellPressure,
-    delta, // موجب = ضغط شرائي
+    delta,
   };
 }
 
@@ -272,13 +343,11 @@ function detectLiquiditySweep(bars) {
   const prevHigh = Math.max(...previousRange.map((b) => b.high));
   const prevLow = Math.min(...previousRange.map((b) => b.low));
 
-  // سحب سيولة أعلى: اخترق قمة ثم رجع وأغلق تحتها
   const sellSweep =
     current.high > prevHigh &&
     current.close < prevHigh &&
     current.close < current.open;
 
-  // سحب سيولة أسفل: كسر قاع ثم رجع وأغلق فوقه
   const buySweep =
     current.low < prevLow &&
     current.close > prevLow &&
@@ -330,7 +399,6 @@ function analyzeSymbol(symbol, bars) {
   const buyReasons = [];
   const sellReasons = [];
 
-  // الاتجاه
   if (trendUp) {
     buyScore += 20;
     buyReasons.push("الاتجاه العام صاعد");
@@ -340,7 +408,6 @@ function analyzeSymbol(symbol, bars) {
     sellReasons.push("الاتجاه العام هابط");
   }
 
-  // Anchored VWAP
   if (aboveAVWAP) {
     buyScore += 15;
     buyReasons.push("السعر فوق Anchored VWAP");
@@ -350,7 +417,6 @@ function analyzeSymbol(symbol, bars) {
     sellReasons.push("السعر تحت Anchored VWAP");
   }
 
-  // Order Flow approximation
   if (orderFlow.delta > 0.18) {
     buyScore += 15;
     buyReasons.push("ضغط شرائي واضح");
@@ -360,7 +426,6 @@ function analyzeSymbol(symbol, bars) {
     sellReasons.push("ضغط بيعي واضح");
   }
 
-  // Volume Profile approximation
   if (aboveVAH) {
     buyScore += 12;
     buyReasons.push("فوق Value Area High");
@@ -375,7 +440,6 @@ function analyzeSymbol(symbol, bars) {
     sellScore -= 4;
   }
 
-  // Liquidity sweep
   if (sweep.buySweep) {
     buyScore += 18;
     buyReasons.push("سحب سيولة سفلي");
@@ -385,7 +449,6 @@ function analyzeSymbol(symbol, bars) {
     sellReasons.push("سحب سيولة علوي");
   }
 
-  // RSI
   if (rsi >= 52 && rsi <= 68) {
     buyScore += 8;
     buyReasons.push("RSI داعم للصعود");
@@ -395,7 +458,6 @@ function analyzeSymbol(symbol, bars) {
     sellReasons.push("RSI داعم للهبوط");
   }
 
-  // الحجم
   if (volumeRatio > 1.15 && current.close > prev.close) {
     buyScore += 10;
     buyReasons.push("حجم داعم للصعود");
@@ -405,7 +467,6 @@ function analyzeSymbol(symbol, bars) {
     sellReasons.push("حجم داعم للهبوط");
   }
 
-  // شروط تشدد قوية للوصول إلى +90
   const hardBuyPass =
     trendUp &&
     aboveAVWAP &&
@@ -523,6 +584,38 @@ app.get("/", (req, res) => {
   res.send("Trading server is running");
 });
 
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "trading-server",
+    startedAt: lastStatus.startedAt,
+    lastRunAt: lastStatus.lastRunAt,
+    lastSuccessAt: lastStatus.lastSuccessAt,
+    lastErrorAt: lastStatus.lastErrorAt,
+    lastErrorMessage: lastStatus.lastErrorMessage,
+    symbols: lastStatus.symbols,
+  });
+});
+
+app.get("/test-api/:symbol?", async (req, res) => {
+  try {
+    const symbol = (req.params.symbol || "TSLA").toUpperCase();
+    const bars = await fetchYahooBars(symbol);
+
+    res.json({
+      ok: true,
+      symbol,
+      barsCount: bars.length,
+      latestBar: bars[bars.length - 1] || null,
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: extractErrorMessage(err),
+    });
+  }
+});
+
 app.post("/api/send-alert", async (req, res) => {
   try {
     const { symbol, decision, confidence, price, email, reasons = [] } = req.body;
@@ -562,7 +655,7 @@ app.post("/api/send-alert", async (req, res) => {
     res.json({ ok: true, result });
   } catch (err) {
     console.error("manual send error:", err);
-    res.status(500).json({ ok: false, reason: err?.message || "server error" });
+    res.status(500).json({ ok: false, reason: extractErrorMessage(err) });
   }
 });
 
@@ -570,51 +663,122 @@ app.post("/api/send-alert", async (req, res) => {
 // جلب وتحليل السوق
 // ===============================
 async function fetchYahooBars(symbol) {
-  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=5d&interval=15m&includePrePost=false`;
-  const response = await fetch(url);
-  const data = await response.json();
-  return buildBarsFromYahoo(data);
+  const encodedSymbol = encodeURIComponent(symbol);
+
+  const urls = [
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodedSymbol}?range=5d&interval=15m&includePrePost=false`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${encodedSymbol}?range=5d&interval=15m&includePrePost=false`,
+  ];
+
+  const data = await fetchWithRetry(urls, {}, MAX_RETRIES);
+  const bars = buildBarsFromYahoo(data);
+
+  if (!bars.length) {
+    throw new Error(`No bars returned for ${symbol}`);
+  }
+
+  return bars;
 }
 
-async function checkMarket() {
+async function checkSingleSymbol(symbol) {
+  const started = Date.now();
+
   try {
-    for (const symbol of SYMBOLS) {
-      const bars = await fetchYahooBars(symbol);
+    const bars = await fetchYahooBars(symbol);
 
-      if (bars.length < 50) {
-        console.log(`⚠️ بيانات غير كافية لـ ${symbol}`);
-        continue;
-      }
+    if (bars.length < 50) {
+      const msg = `بيانات غير كافية لـ ${symbol}: ${bars.length} bars`;
+      console.log(`⚠️ ${msg}`);
 
-      const signal = analyzeSymbol(symbol, bars);
-      console.log(`📊 ${symbol}`, signal);
-
-      const key = `${signal.symbol}-${signal.decision}-${signal.confidence}`;
-
-      if (
-        ["شراء", "بيع"].includes(signal.decision) &&
-        signal.confidence >= 90 &&
-        lastAlerts[symbol] !== key
-      ) {
-        await sendSignalEmail(signal);
-        lastAlerts[symbol] = key;
-        console.log(`📧 تم إرسال تنبيه ${signal.decision} لـ ${symbol}`);
-      }
-
-      if (signal.decision === "انتظار") {
-        lastAlerts[symbol] = null;
-      }
+      lastStatus.symbols[symbol] = {
+        ok: false,
+        lastCheckedAt: nowIso(),
+        bars: bars.length,
+        message: msg,
+      };
+      return;
     }
+
+    const signal = analyzeSymbol(symbol, bars);
+    console.log(`📊 ${symbol}`, signal);
+
+    const key = `${signal.symbol}-${signal.decision}-${signal.confidence}`;
+
+    if (
+      ["شراء", "بيع"].includes(signal.decision) &&
+      signal.confidence >= 90 &&
+      lastAlerts[symbol] !== key
+    ) {
+      await sendSignalEmail(signal);
+      lastAlerts[symbol] = key;
+      console.log(`📧 تم إرسال تنبيه ${signal.decision} لـ ${symbol}`);
+    }
+
+    if (signal.decision === "انتظار") {
+      lastAlerts[symbol] = null;
+    }
+
+    lastStatus.symbols[symbol] = {
+      ok: true,
+      lastCheckedAt: nowIso(),
+      bars: bars.length,
+      ms: Date.now() - started,
+      decision: signal.decision,
+      confidence: signal.confidence,
+      price: signal.price,
+    };
   } catch (err) {
-    console.error("❌ market check error:", err);
+    const msg = extractErrorMessage(err);
+    console.error(`❌ ${symbol} failed:`, msg);
+
+    lastStatus.symbols[symbol] = {
+      ok: false,
+      lastCheckedAt: nowIso(),
+      message: msg,
+      ms: Date.now() - started,
+    };
   }
 }
 
-// تشغيل أول مرة مباشرة
-checkMarket();
+async function checkMarket() {
+  lastStatus.lastRunAt = nowIso();
+  console.log(`\n🕒 checkMarket started at ${lastStatus.lastRunAt}`);
+
+  for (const symbol of SYMBOLS) {
+    await checkSingleSymbol(symbol);
+    await sleep(800);
+  }
+
+  const anySuccess = Object.values(lastStatus.symbols).some((x) => x?.ok === true);
+
+  if (anySuccess) {
+    lastStatus.lastSuccessAt = nowIso();
+    lastStatus.lastErrorMessage = null;
+  } else {
+    lastStatus.lastErrorAt = nowIso();
+    lastStatus.lastErrorMessage = "All symbols failed in this cycle";
+  }
+
+  console.log("✅ checkMarket finished");
+}
+
+// تشغيل أول مرة مباشرة بعد تأخير بسيط
+setTimeout(() => {
+  checkMarket().catch((err) => {
+    lastStatus.lastErrorAt = nowIso();
+    lastStatus.lastErrorMessage = extractErrorMessage(err);
+    console.error("❌ initial market check error:", err);
+  });
+}, 4000);
 
 // ثم كل دقيقتين
-setInterval(checkMarket, CHECK_INTERVAL_MS);
+setInterval(() => {
+  checkMarket().catch((err) => {
+    lastStatus.lastErrorAt = nowIso();
+    lastStatus.lastErrorMessage = extractErrorMessage(err);
+    console.error("❌ scheduled market check error:", err);
+  });
+}, CHECK_INTERVAL_MS);
 
 // ===============================
 // تشغيل السيرفر
@@ -623,4 +787,6 @@ const PORT = process.env.PORT || 3001;
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📡 Symbols: ${SYMBOLS.join(", ")}`);
+  console.log(`⏱️ Check interval: ${CHECK_INTERVAL_MS / 1000}s`);
 });
