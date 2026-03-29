@@ -578,7 +578,7 @@ async function sendSignalEmail(signal) {
 }
 
 // ===============================
-// API يدوي للاختبار
+// Routes
 // ===============================
 app.get("/", (req, res) => {
   res.send("Trading server is running");
@@ -597,9 +597,9 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/test-api/:symbol?", async (req, res) => {
+app.get("/test-api", async (req, res) => {
   try {
-    const symbol = (req.params.symbol || "TSLA").toUpperCase();
+    const symbol = String(req.query.symbol || "TSLA").toUpperCase();
     const bars = await fetchYahooBars(symbol);
 
     res.json({
@@ -762,7 +762,9 @@ async function checkMarket() {
   console.log("✅ checkMarket finished");
 }
 
-// تشغيل أول مرة مباشرة بعد تأخير بسيط
+// ===============================
+// تشغيل الفحص
+// ===============================
 setTimeout(() => {
   checkMarket().catch((err) => {
     lastStatus.lastErrorAt = nowIso();
@@ -771,7 +773,6 @@ setTimeout(() => {
   });
 }, 4000);
 
-// ثم كل دقيقتين
 setInterval(() => {
   checkMarket().catch((err) => {
     lastStatus.lastErrorAt = nowIso();
